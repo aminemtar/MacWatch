@@ -1,0 +1,16 @@
+name: macOS checks
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test detection and chart calculations
+        run: swift test
+      - name: Compile release app
+        run: swift build -c release

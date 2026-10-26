@@ -21,6 +21,11 @@ func command(_ path: String, _ args: [String]) -> String {
 }
 
 @MainActor final class Monitor: ObservableObject {
+    @Published var samples: [ActivitySample] = []
+    @Published var slices: [UsageSlice] = []
+    @Published var systemCPU: Double?
+    @Published var paused = false
+    private var previousTicks: [UInt64]?
     @Published var rows: [ProcessRow] = []
     @Published var events: [ActivityEvent] = []
     @Published var usage: [String: Double] = [:]
@@ -43,10 +48,12 @@ func command(_ path: String, _ args: [String]) -> String {
     init() {
         if let data = try? Data(contentsOf: historyURL), let saved = try? JSONDecoder().decode([ActivityEvent].self, from: data) { events = saved }
         if let data = try? Data(contentsOf: folder.appendingPathComponent("usage.json")), let saved = try? JSONDecoder().decode([String: Double].self, from: data) { usage = saved }
+        if let data = try? Data(contentsOf: folder.appendingPathComponent("samples.json")), let saved = try? JSONDecoder().decode([ActivitySample].self, from: data) { samples = saved.filter { $0.date > Date().addingTimeInterval(-86400) } }
+        if let data = try? Data(contentsOf: folder.appendingPathComponent("slices.json")), let saved = try? JSONDecoder().decode([UsageSlice].self, from: data) { slices = saved.filter { $0.date > Date().addingTimeInterval(-7 * 86400) } }
         task = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                await self.sample()
+                if !self.paused { await self.sample() }
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
@@ -58,6 +65,8 @@ func command(_ path: String, _ args: [String]) -> String {
     func persist() {
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try JSONEncoder().encode(samples).write(to: folder.appendingPathComponent("samples.json"), options: .atomic)
+            try JSONEncoder().encode(slices).write(to: folder.appendingPathComponent("slices.json"), options: .atomic)
             try JSONEncoder().encode(events).write(to: historyURL, options: .atomic)
             try JSONEncoder().encode(usage).write(to: folder.appendingPathComponent("usage.json"), options: .atomic)
         } catch { self.error = "Could not save local history: \(error.localizedDescription)" }
@@ -70,7 +79,8 @@ func command(_ path: String, _ args: [String]) -> String {
         let now = Date()
         let elapsed = now.timeIntervalSince(previousTime)
         idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .null) >= 60
-        if previousActive, !idle, elapsed < 30, let app = previousApp { usage[app, default: 0] += elapsed }
+        if previousActive, !idle, elapsed < 30, let app = previousApp { usage[app, default: 0] += elapsed
+            slices.append(UsageSlice(date: now, app: app, seconds: elapsed)) }
         previousTime = now
         previousApp = NSWorkspace.shared.frontmostApplication?.localizedName
         previousActive = !idle
@@ -85,6 +95,14 @@ func command(_ path: String, _ args: [String]) -> String {
             if thermal == "Hot" || thermal == "Critical" { record("Thermal status: \(thermal). Review the highest CPU processes and check ventilation.") }
             lastThermal = thermal
         }
+        let ticks = SystemCPU.ticks()
+        systemCPU = ticks.flatMap { current in previousTicks.flatMap { Insights.cpuPercent(previous: $0, current: current) } }
+        previousTicks = ticks
+        if samples.last.map({ now.timeIntervalSince($0.date) >= 30 }) ?? true {
+            samples.append(ActivitySample(date: now, cpu: systemCPU, idle: idle, thermal: thermal))
+        }
+        samples.removeAll { $0.date < now.addingTimeInterval(-86400) }
+        slices.removeAll { $0.date < now.addingTimeInterval(-7 * 86400) }
         for alert in rules.evaluate(rows, idle: idle) { record(alert) }
         sampleCount += 1
         if sampleCount == 1 || sampleCount % 6 == 0 {
@@ -112,7 +130,13 @@ func command(_ path: String, _ args: [String]) -> String {
             }.value
         }
     }
-    func clearHistory() { events = []; usage = [:]; persist() }
+    func togglePause() {
+        paused.toggle()
+        previousTime = Date(); previousApp = nil; previousActive = false
+        previousTicks = nil; rules = DetectionRules()
+        persist()
+    }
+    func clearHistory() { events = []; usage = [:]; samples = []; slices = []; persist() }
 }
 
 @main struct MacWatchApp: App {
@@ -142,17 +166,19 @@ struct Dashboard: View {
                 }
                 Spacer()
                 Label(monitor.idle ? "Idle" : "Active", systemImage: "circle.fill").foregroundStyle(.mint)
+                Button(monitor.paused ? "Resume tracking" : "Pause tracking") { monitor.togglePause() }
                 Button("Activity Monitor") { NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app")) }
             }
             HStack(spacing: 12) {
                 metric("Thermal status", monitor.thermal, "thermometer.medium")
                 metric("Processes", "\(monitor.rows.count)", "cpu")
-                metric("Process memory sum", String(format: "%.1f GB", monitor.rows.reduce(0) { $0 + $1.memoryMB } / 1024), "memorychip")
+                metric("System CPU", monitor.systemCPU.map { String(format: "%.0f%%", $0) } ?? "Warming up", "speedometer")
                 metric("Saved alerts", "\(monitor.events.count)", "bell.badge")
             }
             Text("CPU/GPU °C and fan RPM: unavailable in this version. Thermal status is macOS heat pressure, not a temperature measurement. Process memory can count shared pages more than once.").font(.caption).foregroundStyle(.secondary)
             if let error = monitor.error { Text(error).foregroundStyle(.orange) }
             TabView {
+                Overview(monitor: monitor).tabItem { Label("Overview", systemImage: "chart.xyaxis.line") }
                 VStack {
                     TextField("Search process or PID", text: $query).textFieldStyle(.roundedBorder)
                     Table(filtered) {
@@ -190,7 +216,7 @@ struct Dashboard: View {
                     }.padding()
                 }.tabItem { Label("Usage & battery", systemImage: "chart.bar") }
             }
-            HStack { Text("Private • Local • Read only"); Spacer(); if let date = monitor.lastSample { Text("Updated \(date.formatted(date: .omitted, time: .standard))") } }.font(.caption).foregroundStyle(.secondary)
+            HStack { Text(monitor.paused ? "Tracking paused • Data is frozen" : "Private • Local • Read only"); Spacer(); if let date = monitor.lastSample { Text("Updated \(date.formatted(date: .omitted, time: .standard))") } }.font(.caption).foregroundStyle(.secondary)
         }.padding(24).tint(.cyan)
         .confirmationDialog("Delete all saved alerts and app usage?", isPresented: $clear) { Button("Delete history", role: .destructive) { monitor.clearHistory() } }
     }
